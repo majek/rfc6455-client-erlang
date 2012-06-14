@@ -1,6 +1,6 @@
 -module(rfc6455_client).
 
--export([new/2]).
+-export([new/2, open/1, recv/1, send/2, close/1, close/2]).
 
 -record(state, {host, port, addr, path, ppid, socket, data, phase}).
 
@@ -24,6 +24,37 @@ new(WsUrl, PPid) ->
                   start_conn(State)
           end).
 
+open(WS) ->
+    receive
+        {rfc6455, open, WS, Opts} ->
+            {ok, Opts};
+        {rfc6455, close, WS, R} ->
+            {close, R}
+    end.
+
+recv(WS) ->
+    receive
+        {rfc6455, recv, WS, Payload} ->
+            {ok, Payload};
+        {rfc6455, close, WS, R} ->
+            {close, R}
+    end.
+
+send(WS, IoData) ->
+    WS ! {send, IoData},
+    ok.
+
+close(WS) ->
+    close(WS, {1000, ""}).
+
+close(WS, WsReason) ->
+    WS ! {close, WsReason},
+    receive
+        {rfc6455, close, WS, R} ->
+            {close, R}
+    end.
+
+
 %% --------------------------------------------------------------------------
 
 start_conn(State) ->
@@ -42,18 +73,19 @@ start_conn(State) ->
 
     loop(State#state{socket = Socket,
                      data   = <<>>,
-                     phase  = opening}).
+                     phase = opening}).
 
-recv(State = #state{phase = opening, data = Data}) ->
+do_recv(State = #state{phase = opening, ppid = PPid, data = Data}) ->
     case split("\r\n\r\n", binary_to_list(Data), 1, empty) of
         [_Http, empty] -> State;
         [Http, Data1]   ->
-            %% TODO: don't ignore http response
-            io:format("Http response ~p~n", [Http]),
+            %% TODO: don't ignore http response data, verify key
+            PPid ! {rfc6455, open, self(), [{http_response, Http}]},
             State#state{phase = open,
                         data = Data1}
     end;
-recv(State = #state{phase = open, data = Data, socket = Socket, ppid = PPid}) ->
+do_recv(State = #state{phase = Phase, data = Data, socket = Socket, ppid = PPid})
+  when Phase =:= open orelse Phase =:= closing ->
     R = case Data of
             <<F:1, _:3, O:4, 0:1, L:7, Payload:L/binary, Rest/binary>>
               when L < 126 ->
@@ -69,45 +101,74 @@ recv(State = #state{phase = open, data = Data, socket = Socket, ppid = PPid}) ->
                 %% According o rfc6455 5.1 the server must not mask any frames.
                 die(Socket, PPid, {1006, "Protocol error"}, normal);
             _ ->
-                notmatched
+                moredata
         end,
     case R of
-        {1, 1, Payload2, Rest2} ->
-            PPid ! {rfc6455, recv, self(), Payload2},
-            State#state{data = Rest2};
-        notmatched ->
+        moredata ->
             State;
-        {_, _, _, _, Rest2} ->
-            io:format("Unknown frame type~n"),
-            State#state{data = Rest2}
+        _ -> do_recv2(State, R)
     end.
 
-send(State = #state{socket = Socket}, Payload) ->
-    Mask = crypto:rand_bytes(4),
-    MaskedPayload = apply_mask(Mask, Payload),
+do_recv2(State = #state{phase = Phase, socket = Socket, ppid = PPid}, R) ->
+    case R of
+        {1, 1, Payload, Rest} ->
+            PPid ! {rfc6455, recv, self(), Payload},
+            State#state{data = Rest};
+        {1, 8, Payload, _Rest} ->
+            WsReason = case Payload of
+                           <<WC:16, WR/binary>> -> {WC, WR};
+                           <<>> -> {1005, "No status received"}
+                       end,
+            case Phase of
+                open -> %% echo
+                    do_close(State, WsReason),
+                    gen_tcp:close(Socket);
+                closing ->
+                    ok
+            end,
+            die(Socket, PPid, WsReason, normal);
+        {_, _, _, Rest2} ->
+            io:format("Unknown frame type~n"),
+            die(Socket, PPid, {1006, "Unknown frame type"}, normal)
+    end.
 
-    L = byte_size(Payload),
+encode_frame(F, O, Payload) ->
+    Mask = crypto:rand_bytes(4),
+    MaskedPayload = apply_mask(Mask, iolist_to_binary(Payload)),
+
+    L = byte_size(MaskedPayload),
     IoData = case L of
-               _ when L < 126 ->
-                     [<<1:1, 0:3, 1:4, 1:1, L:7>>, Mask, MaskedPayload];
-               _ when L < 65536 ->
-                     [<<1:1, 0:3, 1:4, 1:1, 126:7, L:16>>, Mask, MaskedPayload];
-               _ ->
-                     [<<1:1, 0:3, 1:4, 1:1, 127:7, L:64>>, Mask, MaskedPayload]
+                 _ when L < 126 ->
+                     [<<F:1, 0:3, O:4, 1:1, L:7>>, Mask, MaskedPayload];
+                 _ when L < 65536 ->
+                     [<<F:1, 0:3, O:4, 1:1, 126:7, L:16>>, Mask, MaskedPayload];
+                 _ ->
+                     [<<F:1, 0:3, O:4, 1:1, 127:7, L:64>>, Mask, MaskedPayload]
            end,
-    gen_tcp:send(Socket, iolist_to_binary(IoData)),
+    iolist_to_binary(IoData).
+
+do_send(State = #state{socket = Socket}, Payload) ->
+    gen_tcp:send(Socket, encode_frame(1, 1, Payload)),
     State.
 
-loop(State = #state{socket = Socket, ppid = PPid, data = Data, phase = Phase}) ->
+do_close(State = #state{socket = Socket}, {Code, Reason}) ->
+    Payload = iolist_to_binary([<<Code:16>>, Reason]),
+    gen_tcp:send(Socket, encode_frame(1, 8, Payload)),
+    State#state{phase = closing}.
+
+
+loop(State = #state{socket = Socket, ppid = PPid, data = Data,
+                    phase = Phase}) ->
     receive
         {tcp, Socket, Bin} ->
             State1 = State#state{data = iolist_to_binary([Data, Bin])},
-            loop(recv(State1));
+            loop(do_recv(State1));
         {send, Payload} when Phase == open ->
-            State1 = send(State, iolist_to_binary(Payload)),
-            loop(State1);
+            loop(do_send(State, Payload));
         {tcp_closed, Socket} ->
-            die(Socket, PPid, {1006, "Connection closed abnormally"}, normal)
+            die(Socket, PPid, {1006, "Connection closed abnormally"}, normal);
+        {close, WsReason} when Phase == open ->
+            loop(do_close(State, WsReason))
     end.
 
 
@@ -154,4 +215,6 @@ apply_mask2(<<Mask:16, _:16>>, <<Data:16>>, Acc) ->
     [<<T:16>> | Acc];
 apply_mask2(<<Mask:8, _:24>>, <<Data:8>>, Acc) ->
     T = Data bxor Mask,
-    [<<T:8>> | Acc].
+    [<<T:8>> | Acc];
+apply_mask2(_, <<>>, Acc) ->
+    Acc.

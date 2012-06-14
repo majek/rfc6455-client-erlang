@@ -1,5 +1,5 @@
 #!/usr/bin/env escript
-%%! -pa ebin deps/cowboy/ebin -input
+%%! -input
 -module(test).
 -mode(compile).
 
@@ -13,9 +13,11 @@ main([WsUrl]) ->
 
 loop(WS) ->
     receive
+        {rfc6455, open, WS, Opts} ->
+            io:format("[.] http ~p~n", [Opts]),
+            loop(WS);
         {rfc6455, recv, WS, Payload} ->
             io:format("[.] Recv ~p~n", [Payload]),
-            %% WS ! {send, <<"a[\"aaaaaaaa\"]">>},
             loop(WS);
         {rfc6455, close, WS, R} ->
             io:format("[*] Closed ~p~n", [R]),
